@@ -1,0 +1,9 @@
+cat >> .gitignore << 'EOF'
+
+# Terraform
+microservices-infra/.terraform/
+microservices-infra/*.tfstate
+microservices-infra/*.tfstate.backup
+microservices-infra/.terraform.lock.hcl
+microservices-infra/terraform.tfvars
+EOF
