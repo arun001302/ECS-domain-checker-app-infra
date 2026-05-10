@@ -1,7 +1,4 @@
 # ── CloudWatch Log Groups ─────────────────────────────────────────────────────
-# All container stdout/stderr goes here automatically via awslogs driver
-# This is how you do `kubectl logs` equivalent in ECS —
-# you go to CloudWatch Log Groups instead
 resource "aws_cloudwatch_log_group" "backend" {
   name              = "/ecs/${var.project_name}-${var.environment}/backend"
   retention_in_days = 30
@@ -21,11 +18,6 @@ resource "aws_cloudwatch_log_group" "frontend" {
 }
 
 # ── IAM Role for ECS Task Execution ──────────────────────────────────────────
-# This role is used by the ECS AGENT to:
-# - Pull images from ECR
-# - Write logs to CloudWatch
-# This is NOT the role your application code uses — that would be the Task Role
-# EKS equivalent: the node instance profile or IRSA for kubelet operations
 resource "aws_iam_role" "ecs_task_execution_role" {
   name = "${var.project_name}-${var.environment}-ecs-execution-role"
 
@@ -47,17 +39,12 @@ resource "aws_iam_role" "ecs_task_execution_role" {
   }
 }
 
-# Attach the AWS managed policy for ECS task execution
-# Grants: ECR pull, CloudWatch logs write, SSM parameter read
 resource "aws_iam_role_policy_attachment" "ecs_task_execution_role_policy" {
   role       = aws_iam_role.ecs_task_execution_role.name
   policy_arn = "arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy"
 }
 
 # ── IAM Role for ECS Tasks (Application Role) ─────────────────────────────────
-# This role is assumed BY your application code running inside the container
-# Add permissions here for anything your app needs to call (S3, DynamoDB, etc.)
-# EKS equivalent: IRSA (IAM Roles for Service Accounts)
 resource "aws_iam_role" "ecs_task_role" {
   name = "${var.project_name}-${var.environment}-ecs-task-role"
 
@@ -80,14 +67,11 @@ resource "aws_iam_role" "ecs_task_role" {
 }
 
 # ── Security Group for ECS Tasks ──────────────────────────────────────────────
-# Controls inbound/outbound traffic to the ECS tasks
-# Tasks are in private subnets — only the ALB can reach them
 resource "aws_security_group" "ecs_tasks" {
   name        = "${var.project_name}-${var.environment}-ecs-tasks-sg"
   description = "Security group for ECS tasks"
   vpc_id      = var.vpc_id
 
-  # Allow inbound on port 5000 from ALB (backend)
   ingress {
     from_port       = 5000
     to_port         = 5000
@@ -96,7 +80,6 @@ resource "aws_security_group" "ecs_tasks" {
     description     = "Allow ALB to reach backend"
   }
 
-  # Allow inbound on port 80 from ALB (frontend)
   ingress {
     from_port       = 80
     to_port         = 80
@@ -105,7 +88,6 @@ resource "aws_security_group" "ecs_tasks" {
     description     = "Allow ALB to reach frontend"
   }
 
-  # Allow all outbound — tasks need to reach ECR, CloudWatch, external APIs
   egress {
     from_port   = 0
     to_port     = 0
@@ -120,7 +102,6 @@ resource "aws_security_group" "ecs_tasks" {
 }
 
 # ── Security Group for ALB ────────────────────────────────────────────────────
-# ALB is in public subnets — accepts traffic from the internet
 resource "aws_security_group" "alb" {
   name        = "${var.project_name}-${var.environment}-alb-sg"
   description = "Security group for Application Load Balancer"
@@ -156,18 +137,12 @@ resource "aws_security_group" "alb" {
 }
 
 # ── ECS Cluster ───────────────────────────────────────────────────────────────
-# The logical grouping for all our services
-# Fargate means AWS manages the underlying EC2 instances — you never see them
-# EKS equivalent: the EKS cluster itself, but without node groups to manage
 resource "aws_ecs_cluster" "main" {
   name = "${var.project_name}-${var.environment}-cluster"
 
   setting {
     name  = "containerInsights"
     value = "enabled"
-    # Container Insights enables detailed CloudWatch metrics per task/service
-    # CPU, memory, network, storage metrics at the container level
-    # At GoDaddy this feeds into your Grafana dashboards
   }
 
   tags = {
@@ -176,8 +151,6 @@ resource "aws_ecs_cluster" "main" {
 }
 
 # ── ECS Cluster Capacity Providers ───────────────────────────────────────────
-# Tells the cluster to use Fargate and Fargate Spot
-# Fargate Spot is up to 70% cheaper but can be interrupted (good for dev)
 resource "aws_ecs_cluster_capacity_providers" "main" {
   cluster_name = aws_ecs_cluster.main.name
 
@@ -191,13 +164,9 @@ resource "aws_ecs_cluster_capacity_providers" "main" {
 }
 
 # ── Backend Task Definition ───────────────────────────────────────────────────
-# This is the ECS equivalent of a Kubernetes Pod spec
-# Defines exactly what runs inside the task: image, CPU, memory, ports, logs
 resource "aws_ecs_task_definition" "backend" {
-  family       = "${var.project_name}-${var.environment}-backend"
-  network_mode = "awsvpc"
-  # awsvpc gives each task its own ENI and private IP
-  # Required for Fargate — equivalent to how every K8s pod gets its own IP
+  family                   = "${var.project_name}-${var.environment}-backend"
+  network_mode             = "awsvpc"
   requires_compatibilities = ["FARGATE"]
   cpu                      = var.backend_cpu
   memory                   = var.backend_memory
@@ -208,7 +177,7 @@ resource "aws_ecs_task_definition" "backend" {
     {
       name      = "backend"
       image     = var.backend_image
-      essential = true # If this container dies, the whole task is stopped
+      essential = true
 
       portMappings = [
         {
@@ -228,19 +197,14 @@ resource "aws_ecs_task_definition" "backend" {
         }
       ]
 
-      # Health check — ECS calls this to determine if the task is healthy
-      # Unhealthy tasks are stopped and replaced by the service
-      # Equivalent to Kubernetes livenessProbe
       healthCheck = {
         command     = ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:5000/health')\" || exit 1"]
         interval    = 30
         timeout     = 5
         retries     = 3
-        startPeriod = 60 # Give the container 60s to start before health checks begin
+        startPeriod = 60
       }
 
-      # Log configuration — sends all stdout/stderr to CloudWatch
-      # This is how you see container logs — equivalent to kubectl logs
       logConfiguration = {
         logDriver = "awslogs"
         options = {
@@ -305,8 +269,6 @@ resource "aws_ecs_task_definition" "frontend" {
 }
 
 # ── Application Load Balancer ─────────────────────────────────────────────────
-# Lives in public subnets, routes traffic to ECS tasks in private subnets
-# Path-based routing: /api/* → backend, /* → frontend
 resource "aws_lb" "main" {
   name               = "${var.project_name}-${var.environment}-alb"
   internal           = false
@@ -315,7 +277,6 @@ resource "aws_lb" "main" {
   subnets            = var.public_subnet_ids
 
   enable_deletion_protection = false
-  # Set to true in production at a real company to prevent accidental deletion
 
   tags = {
     Name = "${var.project_name}-${var.environment}-alb"
@@ -323,17 +284,12 @@ resource "aws_lb" "main" {
 }
 
 # ── Target Groups ─────────────────────────────────────────────────────────────
-# Target groups are the bridge between the ALB and ECS tasks
-# ALB forwards requests to a target group, which routes to healthy tasks
-# EKS equivalent: a Kubernetes Service that the Ingress points to
 resource "aws_lb_target_group" "backend" {
   name        = "${var.project_name}-${var.environment}-backend-tg"
   port        = 5000
   protocol    = "HTTP"
   vpc_id      = var.vpc_id
   target_type = "ip"
-  # target_type = "ip" is required for Fargate
-  # Each task gets its own IP via awsvpc networking
 
   health_check {
     enabled             = true
@@ -373,13 +329,11 @@ resource "aws_lb_target_group" "frontend" {
 }
 
 # ── ALB Listener ──────────────────────────────────────────────────────────────
-# Listens on port 80 and routes based on path
 resource "aws_lb_listener" "main" {
   load_balancer_arn = aws_lb.main.arn
   port              = 80
   protocol          = "HTTP"
 
-  # Default action — send to frontend
   default_action {
     type             = "forward"
     target_group_arn = aws_lb_target_group.frontend.arn
@@ -387,7 +341,6 @@ resource "aws_lb_listener" "main" {
 }
 
 # ── ALB Listener Rules ────────────────────────────────────────────────────────
-# Path-based routing: /api/* goes to backend target group
 resource "aws_lb_listener_rule" "backend" {
   listener_arn = aws_lb_listener.main.arn
   priority     = 100
@@ -405,8 +358,6 @@ resource "aws_lb_listener_rule" "backend" {
 }
 
 # ── ECS Backend Service ───────────────────────────────────────────────────────
-# Maintains desired count of tasks and registers them with the ALB target group
-# EKS equivalent: a Kubernetes Deployment + Service combined
 resource "aws_ecs_service" "backend" {
   name            = "${var.project_name}-${var.environment}-backend"
   cluster         = aws_ecs_cluster.main.id
@@ -414,14 +365,12 @@ resource "aws_ecs_service" "backend" {
   desired_count   = var.backend_desired_count
   launch_type     = "FARGATE"
 
-  # Force new deployment when task definition changes
   force_new_deployment = true
 
   network_configuration {
     subnets          = var.private_subnet_ids
     security_groups  = [aws_security_group.ecs_tasks.id]
     assign_public_ip = false
-    # false because tasks are in private subnets behind NAT Gateway
   }
 
   load_balancer {
@@ -470,4 +419,75 @@ resource "aws_ecs_service" "frontend" {
   tags = {
     Name = "${var.project_name}-${var.environment}-frontend-service"
   }
+}
+
+# ── GitHub Actions OIDC Role ──────────────────────────────────────────────────
+# Allows GitHub Actions to authenticate to AWS without stored credentials
+# OIDC = OpenID Connect — GitHub proves its identity to AWS on each run
+resource "aws_iam_role" "github_actions" {
+  name = "${var.project_name}-${var.environment}-github-actions-role"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Principal = {
+          Federated = "arn:aws:iam::${var.account_id}:oidc-provider/token.actions.githubusercontent.com"
+        }
+        Action = "sts:AssumeRoleWithWebIdentity"
+        Condition = {
+          StringLike = {
+            # ✅ FIXED: correct repo name
+            "token.actions.githubusercontent.com:sub" = "repo:arun001302/ECS-domain-checker-app-data:*"
+          }
+          StringEquals = {
+            "token.actions.githubusercontent.com:aud" = "sts.amazonaws.com"
+          }
+        }
+      }
+    ]
+  })
+}
+
+resource "aws_iam_role_policy" "github_actions" {
+  name = "${var.project_name}-${var.environment}-github-actions-policy"
+  role = aws_iam_role.github_actions.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Action = [
+          "ecr:GetAuthorizationToken",
+          "ecr:BatchCheckLayerAvailability",
+          "ecr:GetDownloadUrlForLayer",
+          "ecr:BatchGetImage",
+          "ecr:PutImage",
+          "ecr:InitiateLayerUpload",
+          "ecr:UploadLayerPart",
+          "ecr:CompleteLayerUpload"
+        ]
+        Resource = "*"
+      },
+      {
+        Effect = "Allow"
+        Action = [
+          "ecs:UpdateService",
+          "ecs:DescribeServices",
+          "ecs:DescribeTaskDefinition",
+          "ecs:RegisterTaskDefinition"
+        ]
+        Resource = "*"
+      },
+      {
+        Effect = "Allow"
+        Action = [
+          "iam:PassRole"
+        ]
+        Resource = "*"
+      }
+    ]
+  })
 }
